@@ -110,6 +110,7 @@
 
   .logl { font:12px/1.7 ui-monospace,Menlo,monospace; color:var(--dim); }
   .empty { text-align:center; color:var(--dim); margin:50px 10px; line-height:1.6; font-size:14px; }
+  .aiout { margin:8px 0 0; padding:0; white-space:pre-wrap; word-break:break-word; font:12px/1.5 ui-monospace,Menlo,monospace; color:var(--dim); max-height:170px; overflow:auto; }
 </style>
 </head>
 <body>
@@ -291,10 +292,126 @@ function renderForm(id) {
     '<option value="time"' + (m && m.criterion === 'time' ? ' selected' : '') + '>Временной (потребление / удержание)</option>' +
     '<option value="volume"' + (m && m.criterion === 'volume' ? ' selected' : '') + '>Объёмный (производство результата)</option></select>' +
     '<div class="lbl">МИКРО-МАНДАТЫ (по одному в строке)</div><textarea id="f_micro" rows="4">' + esc(m ? m.micro.join('\n') : '') + '</textarea></div>' +
+    aiPanel() +
     '<div class="row"><button class="btn" style="flex:1;background:var(--blue);color:#021018;border:none" onclick="saveForm(' + (id ? "'" + id + "'" : 'null') + ')">СОХРАНИТЬ</button>' +
     '<button class="btn" onclick="' + (id ? "openM('" + id + "')" : 'renderList()') + '">ОТМЕНА</button></div></div>';
   h(out);
 }
+
+// ---------- ИИ-декомпозиция (вне цикла, только черновик) ----------
+function aiBridge() { return (typeof NvelAI !== 'undefined') ? NvelAI : null; }
+function aiStatus() {
+  var b = aiBridge();
+  if (!b) return { available: false };
+  try { return JSON.parse(b.status()); } catch (e) { return { available: false }; }
+}
+function aiPanelInner() {
+  var s = aiStatus();
+  var o = '<div class="lbl">ИИ-ДЕКОМПОЗИЦИЯ · ВНЕ ЦИКЛА</div>';
+  if (!s.available) {
+    return o + '<div class="rtxt">Работает только в приложении на телефоне.</div>';
+  }
+  if (!s.hasModel) {
+    o += '<div class="rtxt">Выбери файл модели .gguf на телефоне. Он один раз скопируется внутрь приложения.</div>' +
+      '<button class="btn" onclick="aiPick()">ВЫБРАТЬ МОДЕЛЬ (.gguf)</button>';
+  } else {
+    o += '<div class="rtxt">Модель: ' + s.modelMb + ' МБ' + (s.loaded ? ' · в памяти' : '') + '</div>' +
+      '<div class="row"><button class="btn" id="ai_go" onclick="aiRun()">РАЗБИТЬ НА МИКРО-МАНДАТЫ</button>' +
+      '<button class="btn small" id="ai_stop" onclick="aiCancel()" style="display:none">СТОП</button></div>' +
+      '<div class="row" style="margin-top:10px"><button class="btn small" onclick="aiPick()">СМЕНИТЬ МОДЕЛЬ</button>' +
+      '<button class="btn small" onclick="aiDelete()">УДАЛИТЬ МОДЕЛЬ</button></div>';
+  }
+  return o + '<div id="ai_msg" class="rtxt" style="margin-top:10px"></div><pre id="ai_out" class="aiout"></pre>' +
+    '<div class="rfoot mono">ИИ только предлагает черновик. Сигналы, лог и решения остаются за тобой.</div>';
+}
+function aiPanel() { return '<div class="panel" id="ai_panel">' + aiPanelInner() + '</div>'; }
+function aiRefresh() { var p = document.getElementById('ai_panel'); if (p) p.innerHTML = aiPanelInner(); }
+function aiMsg(s) { var e = document.getElementById('ai_msg'); if (e) e.textContent = s; }
+function aiOut(s) { var e = document.getElementById('ai_out'); if (e) e.textContent = s; }
+function aiBusyUi(on) {
+  var g = document.getElementById('ai_go'), s = document.getElementById('ai_stop');
+  if (g) g.disabled = on;
+  if (s) s.style.display = on ? '' : 'none';
+}
+function aiPick() { var b = aiBridge(); if (b) { aiMsg('Выбери файл .gguf в окне телефона...'); b.pickModel(); } }
+function aiCancel() { var b = aiBridge(); if (b) b.cancel(); }
+function aiDelete() {
+  var b = aiBridge();
+  if (b && confirm('Удалить модель с телефона?')) b.deleteModel();
+}
+
+function aiPrompt(domain, mandate) {
+  var has = !!mandate;
+  return 'Ты помогаешь составить задачу на один день.\n' +
+    'Область: ' + domain + '\n' +
+    (has ? 'Задача на день: ' + mandate + '\n' : '') +
+    '\nПравила:\n' +
+    '1. ' + (has ? '' : 'Сначала придумай простую задачу на один день одной строкой. ') +
+    'Разбей задачу на 3-5 конкретных действий, которые выполняются подряд, без выбора и решений.\n' +
+    '2. Каждое действие в одну строку, начинается с глагола, без пояснений и без отдельного времени.\n' +
+    '3. Критерий: "время", если задача про чтение, изучение, прослушивание или удержание процесса. ' +
+    '"объём", если нужно создать результат: написать, сделать, решить.\n' +
+    '\nОтвечай строго в таком формате и ничего больше:\n' +
+    (has ? '' : 'МАНДАТ: <задача одной строкой>\n') +
+    'КРИТЕРИЙ: время или объём\n- действие\n- действие\n- действие\n' +
+    '\nПример.\nОбласть: Гитара\nЗадача на день: 30 минут игры\n' +
+    'КРИТЕРИЙ: время\n- Разогреть пальцы гаммой До мажор\n- Сыграть гамму три раза под метроном\n- Разобрать один такт выбранной песни\n' +
+    '\nТеперь твой ответ.';
+}
+
+function aiParse(text) {
+  var crit = null, mand = '', micro = [];
+  text.split('\n').forEach(function (line) {
+    var t = line.trim();
+    if (!t) return;
+    var a = /^\**\s*КРИТЕРИЙ\s*\**\s*:\s*(.+)$/i.exec(t);
+    if (a) { crit = /объ[её]м/i.test(a[1]) ? 'volume' : 'time'; return; }
+    var b = /^\**\s*МАНДАТ\s*\**\s*:\s*(.+)$/i.exec(t);
+    if (b) { mand = b[1].replace(/\*+/g, '').trim(); return; }
+    var c = /^(?:[-*•–]|\d+[.)])\s+(.+)$/.exec(t);
+    if (c) micro.push(c[1].replace(/\*+/g, '').trim());
+  });
+  return { crit: crit, mand: mand, micro: micro.slice(0, 7) };
+}
+
+function aiRun() {
+  var b = aiBridge(); if (!b) return;
+  var name = document.getElementById('f_name').value.trim();
+  var text = document.getElementById('f_text').value.trim();
+  if (!name) { alert('Сначала впиши домен'); return; }
+  aiOut('');
+  aiBusyUi(true);
+  aiMsg('Запускаю нейросеть...');
+  b.generate(aiPrompt(name, text), 220);
+}
+
+function aiApply(text) {
+  var d = aiParse(text);
+  if (!d.micro.length) { aiMsg('Не получилось разобрать ответ. Нажми ещё раз.'); return; }
+  var c = document.getElementById('f_crit'), t = document.getElementById('f_text'), mi = document.getElementById('f_micro');
+  if (c && d.crit) c.value = d.crit;
+  if (t && !t.value.trim() && d.mand) t.value = d.mand;
+  if (mi) mi.value = d.micro.join('\n');
+  aiMsg('Черновик вставлен в форму. Проверь, поправь и сохрани.');
+}
+
+window.nvelAiEvent = function (e) {
+  if (!e) return;
+  var mb = function (n) { return Math.round(n / 1048576); };
+  switch (e.type) {
+    case 'copyProgress':
+      aiMsg('Копирую модель: ' + mb(e.done) + (e.total > 0 ? ' из ' + mb(e.total) + ' МБ (' + Math.floor(e.done * 100 / e.total) + '%)' : ' МБ'));
+      break;
+    case 'copyDone': aiRefresh(); aiMsg('Модель сохранена.'); break;
+    case 'copyCancel': aiMsg(''); break;
+    case 'modelDeleted': aiRefresh(); aiMsg('Модель удалена.'); break;
+    case 'loading': aiMsg('Загружаю модель в память (при первом запуске до минуты)...'); break;
+    case 'started': aiMsg('Нейросеть думает...'); break;
+    case 'token': aiOut(e.text); break;
+    case 'done': aiBusyUi(false); aiOut(e.text); aiApply(e.text); break;
+    case 'error': aiBusyUi(false); aiMsg('Ошибка: ' + e.message); break;
+  }
+};
 
 function saveForm(id) {
   var name = document.getElementById('f_name').value.trim();
